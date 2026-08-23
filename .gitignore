@@ -4,17 +4,14 @@ data/outputs/
 # 입력 데이터 (대용량 CSV)
 data/inputs/
 
+# html figure 생성 경로
+data/figures
+
 # 실시간 수집 버퍼
 buffer.jsonl
 
 # Python 캐시
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-.Python
 
-# 가상환경
-.venv/
-venv/
-env/
+
+

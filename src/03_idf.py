@@ -58,12 +58,12 @@ def fit(
 def update(
     path: str | Path,
     new_token_seqs: Iterable[list[str]],
-) -> tuple[dict[str, float], int]:
+) -> tuple[dict[str, float], int, dict[str, int]]:
     """
     기존 idf.json에 새 문서들을 증분 반영해 IDF를 갱신한다.
 
     new_token_seqs: 새로 추가된 문서들의 토큰 리스트
-    returns: (updated_idf, updated_n_docs)
+    returns: (updated_idf, updated_n_docs, df_counts)
     """
     with open(path, encoding="utf-8") as f:
         data = json.load(f)
@@ -81,13 +81,14 @@ def update(
         df.update(unique)
 
     if new_docs == 0:
-        return data["idf"], n_docs
+        return data["idf"], n_docs, dict(df)
 
     n_docs += new_docs
-    idf = _compute_idf(df, n_docs, max_df)
+    df_dict = dict(df)
+    idf = _compute_idf(df_dict, n_docs, max_df)
 
-    _write(path, idf, n_docs, max_df, dict(df))
-    return idf, n_docs
+    _write(path, idf, n_docs, max_df, df_dict)
+    return idf, n_docs, df_dict
 
 
 def unseen_idf(n_docs: int) -> float:
@@ -120,7 +121,7 @@ def save(
     _write(path, idf, n_docs, max_df, df or {})
 
 
-def load(path: str | Path) -> tuple[dict[str, float], int]:
+def load(path: str | Path) -> tuple[dict[str, float], int, dict[str, int]]:
     with open(path, encoding="utf-8") as f:
         data = json.load(f)
-    return data["idf"], data["n_docs"]
+    return data["idf"], data["n_docs"], data.get("df", {})

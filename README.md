@@ -1,105 +1,79 @@
 # word_extractor
 
-유튜브 영상 title + description에서 일별 핵심 키워드를 추출하는 파이프라인.
-
-## 파이프라인 구조
-
-```
-video_video.csv
-      │
-      ▼
-01_preprocess  →  텍스트 정제 (URL 제거, 상투문구 제거, 불용어 목록)
-      │
-      ▼
-02_tokenize    →  형태소 분석 (kiwipiepy) → NNG / NNP / SL 토큰
-      │
-      ▼
-03_idf         →  코퍼스 전체 IDF 계산 → idf.json 저장/로드
-      │
-      ▼
-04_extract     →  TF-IDF 스코어링 → 문서당 상위 N 키워드
-      │
-      ▼ (선택)
-05_rerank      →  문서 임베딩 유사도 보정 (ko-sroberta-multitask)
-      │
-      ▼
-daily_keywords.json
-```
+유튜브 영상 title + description에서 일별·영상별 핵심 키워드를 추출하는 파이프라인.
 
 ## 실행
 
 ```bash
-# 기본 실행 (전체 파이프라인)
-python run_pipeline.py
+./run.sh full              # 전체 파이프라인 (백그라운드)
+./run.sh update            # 증분 업데이트 — 마지막 날짜 자동 감지
+./run.sh refit             # IDF + 수식어 전체 재계산
+./run.sh wordcloud         # 오늘 날짜 워드클라우드
+./run.sh wordcloud DATE    # 특정 날짜  (ex: 2026-08-09)
+./run.sh log               # 백그라운드 로그 실시간 확인
+```
 
-# IDF 재계산 (불용어 변경 후 등)
-python run_pipeline.py --refit-idf
+## 파이프라인
 
-# 임베딩 재순위 적용 (느림, 품질 향상)
-python run_pipeline.py --use-rerank
+```
+ 1  CSV 로딩        날짜 파싱, 증분 필터
+ 2  형태소 분석     kiwi 배치 — NNG/NNP/SL 추출 + 수식어 비율 계산  ①
+ 3  IDF             전체 학습 / 로드 / 증분 갱신 → idf.json
+ 4  임베딩          ko-sroberta-multitask
+ 5  키워드 추출     TF-IDF → max_df · modifier · sim 필터 → rerank
+ 6  저장            daily_keywords.json + video_keywords.json
+```
 
-# 문서당 추출 키워드 수 변경
-python run_pipeline.py --top-n 15
+① 수식어 비율: 파일 없거나 `refit`이면 계산 후 word_modifier.json 저장. 이후 실행에서는 로드만.
 
-# 경로 커스텀
-python run_pipeline.py --csv data.csv --idf-out idf.json --out daily_keywords.json
+## 필터 (Stage 5)
+
+| 필터 | 기준 | 제거 예시 |
+|---|---|---|
+| max_df | 전체 문서 5% 초과 | 전국, 서울 |
+| modifier | NNG 수식어 비율 > 0.80 | 역대(0.982), 긴급(0.975) |
+| sim | doc-keyword cosine < 0.20 | 문서와 무관한 단어 |
+
+## 파일 구성
+
+```
+word_extractor/
+├── run.sh
+└── src/
+    ├── pipeline.py       메인 파이프라인
+    ├── 01_preprocess.py  텍스트 정제, 불용어
+    ├── 02_tokenize.py    형태소 분석 (kiwipiepy)
+    ├── 03_idf.py         IDF 계산 / 저장 / 로드
+    ├── 04_extract.py     TF-IDF 스코어링
+    ├── 05_rerank.py      임베딩 유사도 재순위
+    └── 06_visualize.py   워드클라우드 HTML 생성
+
+data/outputs/
+├── idf.json              어휘 IDF 값
+├── word_modifier.json    단어별 수식어 비율
+├── daily_keywords.json   날짜별 상위 키워드
+├── video_keywords.json   영상별 top-10 키워드
+└── figures/              날짜별 워드클라우드 HTML
 ```
 
 ## 출력 형식
 
-`daily_keywords.json`
-
+**`daily_keywords.json`**
 ```json
 {
-  "2026-08-09": [["폭염", 12], ["트럼프", 8], ["태풍", 7], ...],
-  "2026-08-08": [["경선", 10], ["코스피", 6], ...],
-  ...
+  "2026-08-09": [["폭염", 12], ["태풍", 8], ["경선", 7]],
+  "2026-08-08": [["경선", 10], ["코스피", 6]]
 }
 ```
 
-- 키: `YYYY-MM-DD`
-- 값: `[키워드, 해당_날짜_문서_수]` 리스트, 상위 50개
-
-## 모듈별 설명
-
-| 파일 | 역할 | 주요 함수 |
-|------|------|-----------|
-| `01_preprocess.py` | 텍스트 정제, 불용어 관리 | `clean_text`, `strip_boilerplate`, `combined_text`, `DEFAULT_STOPWORDS` |
-| `02_tokenize.py` | 형태소 분석 | `tokenize(text, stopwords)`, `weighted_tf(tagged)` |
-| `03_idf.py` | IDF 계산/저장/로드 | `fit(token_seqs)`, `save`, `load`, `unseen_idf` |
-| `04_extract.py` | TF-IDF 스코어링 | `score_keywords(tf, idf, n_docs)`, `top_keywords` |
-| `05_rerank.py` | 임베딩 유사도 재순위 | `Reranker().rerank(doc_text, ranked)` |
-| `run_pipeline.py` | 전체 파이프라인 실행 | — |
+**`video_keywords.json`**
+```json
+{
+  "video_id": ["폭염", "태풍", "강원", "경보"]
+}
+```
 
 ## 불용어 관리
 
-**`01_preprocess.py`의 `DEFAULT_STOPWORDS`** 가 정본.  
-불용어 추가 후 `--refit-idf` 옵션으로 재실행하면 idf.json도 갱신됨.
-
-```python
-# 01_preprocess.py
-DEFAULT_STOPWORDS: set[str] = {
-    # 유튜브 UI / 포맷 용어
-    "Shorts", "zip", "자막", ...
-    # 방송사 채널명 / 뉴스 프로그램명
-    "MBC뉴스", "YTN", "JTBC", ...
-}
-```
-
-## 데이터
-
-| 파일 | 크기 | 내용 |
-|------|------|------|
-| `video_video.csv` | 272 MB | 유튜브 영상 259,583개 (2014-04 ~ 2026-08) |
-| `idf.json` | — | 어휘 74,805개 IDF 값 |
-| `daily_keywords.json` | ~2.4 MB | 3,520일 × 상위 50 키워드 |
-
-## 소요 시간 (259K 문서 기준)
-
-| 단계 | 시간 |
-|------|------|
-| IDF 학습 | ~9분 |
-| 키워드 추출 | ~9분 |
-| **전체** | **~18분** |
-
-※ `idf.json` 존재 시 IDF 학습 생략 → ~9분으로 단축
+`src/01_preprocess.py`의 `DEFAULT_STOPWORDS`가 정본.  
+수정 후 `./run.sh refit`으로 재실행하면 idf.json · word_modifier.json 모두 갱신됨.
