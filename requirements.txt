@@ -1,8 +1,0 @@
-huggingface_hub>=1.25.1
-kiwipiepy==0.23.2
-numpy>=2.0
-pandas>=2.0
-sentence-transformers>=5.0
-torch>=2.0
-transformers>=4.40
-wordcloud>=1.9

@@ -42,9 +42,11 @@ def tokenize(
 
 def weighted_tf(
     tagged: list[tuple[str, str]],
+    nnp_weight: float = 2.0,
 ) -> dict[str, float]:
-    """(token, tag) 리스트 → {token: weighted_tf}."""
+    """(token, tag) 리스트 → {token: weighted_tf}. NNP/SL은 nnp_weight 배 가중."""
     tf: dict[str, float] = {}
     for form, tag in tagged:
-        tf[form] = tf.get(form, 0.0) + 1.0
+        w = nnp_weight if tag in ("NNP", "SL") else 1.0
+        tf[form] = tf.get(form, 0.0) + w
     return tf
