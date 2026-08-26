@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
 import sys
 import time
 from collections import Counter, defaultdict
@@ -56,10 +57,13 @@ parser.add_argument("--max-df",        type=float, default=0.05, metavar="F",
                     help="전체 문서 비율 상한 (기본 0.05=5%% 초과 단어 제거)")
 parser.add_argument("--modifier-threshold", type=float, default=0.80, metavar="F",
                     help="수식어 비율 상한 [0,1] NNG만 적용 (기본 0.80)")
-parser.add_argument("--top-n",        type=int, default=10, metavar="N",
-                    help="문서당 추출 키워드 수 (기본 10)")
-parser.add_argument("--min-df",       type=int, default=3,  metavar="N",
+parser.add_argument("--top-n",        type=int, default=5,  metavar="N",
+                    help="영상당 최종 키워드 수 상한 (기본 5, 버스트 스코어 순 상위 N개)")
+parser.add_argument("--min-df",        type=int,   default=3,   metavar="N",
                     help="일별 키워드 최소 문서 수 (기본 3, 미만이면 제외)")
+parser.add_argument("--burst-smooth",  type=float, default=1.0, metavar="F",
+                    help="버스트 감지 평활화 상수 (기본 1.0). "
+                         "낮을수록 희귀어 버스트 강조, 높을수록 완화")
 parser.add_argument("--emb-batch",     type=int, default=256, metavar="N",
                     help="임베딩 배치 크기 (GPU 메모리에 맞게 조정, 기본 256)")
 parser.add_argument("--csv",            default="data/inputs/video_video.csv",      metavar="PATH")
@@ -137,10 +141,11 @@ video_ids = df_proc["video_id"].tolist()
 
 # ── 2  형태소 분석 (Stage 3 IDF + Stage 6 modifier + Stage 7 추출, kiwi 1회) ──
 need_modifier = (args.refit_idf or not MODIFIER_PATH.exists()) and not UPDATE_FROM
-print("▶ 2  형태소 분석 (배치, num_workers=4)...")
+_kiwi_workers = min(32, max(4, os.cpu_count() // 2))
+print(f"▶ 2  형태소 분석 (배치, num_workers={_kiwi_workers})...")
 t0 = time.time()
 from kiwipiepy import Kiwi as _KiwiBatch
-_kiwi_batch = _KiwiBatch(num_workers=4)
+_kiwi_batch = _KiwiBatch(num_workers=_kiwi_workers)
 _KEEP = frozenset({"NNG", "NNP", "SL"})
 _MOD_HEAD_PREFIXES = ("J", "X", "E", "SF", "SP")
 all_tagged_seqs: list[list[tuple[str, str]]] = []
@@ -253,6 +258,13 @@ for idx, (text, date, vid) in enumerate(zip(texts, dates, video_ids)):
                   if word_tags.get(w, "NNG") != "NNG"
                   or word_modifier.get(w, 0.0) < args.modifier_threshold]
     ranked = reranker.rerank(doc_embs[idx], ranked, threshold=args.sim_threshold)
+    # 버스트 스코어로 재정렬: tfidf_score / (df_rate + smooth)
+    # df_rate = df / n_docs → 흔할수록 낮은 버스트
+    ranked = sorted(
+        ranked,
+        key=lambda ws: ws[1] / (df_counts.get(ws[0], 0) / n_docs + args.burst_smooth / n_docs),
+        reverse=True,
+    )
     top_kws = [w for w, _ in ranked[:TOP_N]]
     daily_count[date].update(top_kws)
     video_kw[str(vid)] = top_kws
@@ -266,8 +278,11 @@ print(f"   완료: {time.time() - t0:.1f}s")
 
 # ── 6  저장 ───────────────────────────────────────────────────────────────────
 print("▶ 6  저장 중...")
+
+# Stage 5에서 이미 burst 기준으로 top-N을 뽑았으므로
+# daily_count는 burst 필터를 통과한 단어만 집계됨 → count 순 정렬로 충분
 result = {
-    date: [(w, c) for w, c in daily_count[date].most_common(30) if c >= MIN_DF]
+    date: [[w, c] for w, c in daily_count[date].most_common(30) if c >= MIN_DF]
     for date in sorted(daily_count)
 }
 
