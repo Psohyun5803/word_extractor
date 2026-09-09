@@ -1,0 +1,15 @@
+function mw(text, size, weight) {
+  if (fontsReady) {
+    ctx.font = weight + ' ' + size + 'px "Noto Sans KR",sans-serif';
+    return ctx.measureText(text).width * 1.08 + 10;
+  }
+  let w = 0;
+  for (const c of text) w += c.charCodeAt(0) > 0x2E80 ? size * .95 : size * .58;
+  return w * 1.12 + 10;
+}
+
+function overlaps(x, y, w, h, pl) {
+  for (const p of pl)
+    if (x-3 < p.x+p.w && x+w+3 > p.x && y-3 < p.y+p.h && y+h+3 > p.y) return true;
+  return false;
+}

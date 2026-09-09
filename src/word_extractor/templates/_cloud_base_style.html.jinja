@@ -1,0 +1,17 @@
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; background: #111009; color: #ede8e0;
+              font-family: 'Noto Sans KR', sans-serif; overflow: hidden; }
+#cloud { position: relative; width: 100%; height: calc(100vh - {{ cloud_height_offset }}px); overflow: hidden; }
+.w { position: absolute; white-space: nowrap; cursor: default; user-select: none;
+      font-family: 'Noto Sans KR', sans-serif; line-height: 1; transition: opacity .12s; }
+.w:hover { opacity: .6; }
+.r1   { color: #e03b2f; }
+.r2   { color: #e03b2f; opacity: .78; }
+.r3   { color: #e03b2f; opacity: .58; }
+.rmid { color: #ede8e0; }
+.rlow { color: #7a7368; }
+#tip { position: fixed; background: #ede8e0; color: #111009; padding: 4px 10px;
+        border-radius: 3px; font-size: 12px; pointer-events: none; opacity: 0;
+        transition: opacity .08s; z-index: 99; white-space: nowrap; }
+</style>

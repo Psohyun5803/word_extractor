@@ -1,9 +1,9 @@
 #!/bin/bash
 set -e
 
-VENV=../venv/bin/python
+VENV=.venv/bin/python
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PIPELINE=src/pipeline.py
+PIPELINE=src/word_extractor/pipeline.py
 LOG=/tmp/pipeline_run.log
 
 cd "$SCRIPT_DIR"
