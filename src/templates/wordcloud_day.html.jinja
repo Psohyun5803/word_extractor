@@ -1,0 +1,70 @@
+<!doctype html><html lang="ko"><head><meta charset="utf-8">
+<title>워드 클라우드 {{ date }}</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Serif+KR:wght@700&family=Noto+Sans+KR:wght@400;500;600;700&display=swap">
+{% include "_cloud_base_style.html.jinja" %}
+<style>
+header { padding: 18px 28px 12px; border-bottom: 1px solid #2e2820; }
+.date-main { font-family: 'Noto Serif KR', serif; font-size: clamp(22px,4vw,40px);
+              font-weight: 700; line-height: 1.1; }
+.date-sub  { font-size: 12.5px; color: #7a7368; margin-top: 5px; }
+</style>
+</head><body>
+<header>
+  <div class="date-main">{{ year }}년 {{ month }}월 {{ day }}일</div>
+  <div class="date-sub">{{ dow }}요일 &nbsp;·&nbsp; {{ pairs|length }}개 키워드</div>
+</header>
+<div id="cloud"></div>
+<div id="tip"></div>
+<script>
+const PAIRS = {{ pairs | tojson }};
+const tip   = document.getElementById('tip');
+const cloud = document.getElementById('cloud');
+const mc    = document.createElement('canvas');
+const ctx   = mc.getContext('2d');
+let fontsReady = false;
+document.fonts.ready.then(() => { fontsReady = true; });
+
+{% include "_cloud_algo.js.jinja" %}
+
+function render() {
+  cloud.innerHTML = '';
+  const cW = cloud.offsetWidth, cH = cloud.offsetHeight;
+  const cx = cW / 2, cy = cH / 2;
+  const maxC = PAIRS[0][1];
+  const placed = [], frag = document.createDocumentFragment();
+
+  PAIRS.forEach(([text, count], i) => {
+    const t    = Math.log(count + 1) / Math.log(maxC + 1);
+    const size = Math.round(13 + t * 68);
+    const wt   = i < 3 ? '700' : i < 10 ? '600' : i < 20 ? '500' : '400';
+    const cls  = i === 0 ? 'r1' : i === 1 ? 'r2' : i === 2 ? 'r3' : i < 12 ? 'rmid' : 'rlow';
+    const tw   = mw(text, size, wt), th = size * 1.38;
+
+    for (let s = 0; s <= 3000; s++) {
+      const angle = s * .42, r = s * 2.2;
+      const x = cx + r * Math.cos(angle) - tw / 2;
+      const y = cy + r * Math.sin(angle) - th / 2;
+      if (!overlaps(x, y, tw, th, placed)) {
+        placed.push({ x, y, w: tw, h: th });
+        const el = document.createElement('span');
+        el.className = 'w ' + cls;
+        el.textContent = text;
+        el.style.cssText = `left:${x}px;top:${y}px;font-size:${size}px;font-weight:${wt}`;
+        el.addEventListener('mousemove', e => {
+          tip.textContent = text + '  ' + count + '개 문서';
+          tip.style.cssText = `left:${e.clientX+12}px;top:${e.clientY-28}px;opacity:1`;
+        });
+        el.addEventListener('mouseleave', () => tip.style.opacity = 0);
+        frag.appendChild(el);
+        break;
+      }
+    }
+  });
+  cloud.appendChild(frag);
+}
+
+document.fonts.ready.then(render);
+setTimeout(render, 600);
+let t; window.addEventListener('resize', () => { clearTimeout(t); t = setTimeout(render, 120); });
+</script>
+</body></html>

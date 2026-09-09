@@ -1,0 +1,129 @@
+<!doctype html><html lang="ko"><head><meta charset="utf-8">
+<title>워드 클라우드 전체</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Serif+KR:wght@700&family=Noto+Sans+KR:wght@400;500;600;700&display=swap">
+{% include "_cloud_base_style.html.jinja" %}
+<style>
+header { padding: 12px 24px 10px; border-bottom: 1px solid #2e2820;
+          display: flex; align-items: center; gap: 18px; flex-wrap: wrap; }
+.date-main { font-family: 'Noto Serif KR', serif; font-size: clamp(20px,3.5vw,36px);
+              font-weight: 700; line-height: 1.1; min-width: 220px; }
+.date-sub  { font-size: 12px; color: #7a7368; margin-top: 4px; }
+#controls  { display: flex; align-items: center; gap: 10px; flex: 1; min-width: 260px; }
+#slider    { flex: 1; accent-color: #e03b2f; cursor: pointer; height: 3px; }
+#play-btn  { background: none; border: 1px solid #3a3530; color: #ede8e0;
+              padding: 5px 14px; border-radius: 3px; cursor: pointer; font-size: 13px;
+              font-family: 'Noto Sans KR', sans-serif; white-space: nowrap; }
+#play-btn:hover { border-color: #e03b2f; color: #e03b2f; }
+#pos       { font-size: 11px; color: #7a7368; white-space: nowrap; }
+</style>
+</head><body>
+<header>
+  <div>
+    <div class="date-main" id="date-label">-</div>
+    <div class="date-sub"  id="date-sub">-</div>
+  </div>
+  <div id="controls">
+    <button id="play-btn">▶ 재생</button>
+    <input  id="slider" type="range" min="0" max="{{ dates|length - 1 }}" value="{{ dates|length - 1 }}">
+    <span   id="pos">1 / {{ dates|length }}</span>
+  </div>
+</header>
+<div id="cloud"></div>
+<div id="tip"></div>
+<script>
+const DATA   = {{ data | tojson }};
+const DATES  = {{ dates | tojson }};
+const slider = document.getElementById('slider');
+const label  = document.getElementById('date-label');
+const sub    = document.getElementById('date-sub');
+const posEl  = document.getElementById('pos');
+const playBtn= document.getElementById('play-btn');
+const tip    = document.getElementById('tip');
+const cloud  = document.getElementById('cloud');
+const mc     = document.createElement('canvas');
+const ctx    = mc.getContext('2d');
+let fontsReady = false, playing = false, playTimer = null;
+document.fonts.ready.then(() => { fontsReady = true; });
+
+const DAYS = ['월','화','수','목','금','토','일'];
+
+function parseDate(d) {
+  const [y,m,dd] = d.split('-').map(Number);
+  return { y, m, dd, dow: DAYS[new Date(y,m-1,dd).getDay() === 0 ? 6 : new Date(y,m-1,dd).getDay()-1] };
+}
+
+{% include "_cloud_algo.js.jinja" %}
+
+function render(idx) {
+  const date  = DATES[idx];
+  const pairs = DATA[date] || [];
+  const pd    = parseDate(date);
+
+  label.textContent = pd.y + '년 ' + pd.m + '월 ' + pd.dd + '일';
+  sub.textContent   = pd.dow + '요일 · ' + pairs.length + '개 키워드';
+  posEl.textContent = (idx+1) + ' / ' + DATES.length;
+
+  cloud.innerHTML = '';
+  if (!pairs.length) return;
+
+  const cW = cloud.offsetWidth, cH = cloud.offsetHeight;
+  const cx = cW/2, cy = cH/2;
+  const maxC = pairs[0][1];
+  const placed = [], frag = document.createDocumentFragment();
+
+  pairs.forEach(([text, count], i) => {
+    const t    = Math.log(count+1) / Math.log(maxC+1);
+    const size = Math.round(13 + t*68);
+    const wt   = i<3?'700':i<10?'600':i<20?'500':'400';
+    const cls  = i===0?'r1':i===1?'r2':i===2?'r3':i<12?'rmid':'rlow';
+    const tw   = mw(text, size, wt), th = size*1.38;
+
+    for (let s=0; s<=3000; s++) {
+      const angle = s*.42, r = s*2.2;
+      const x = cx + r*Math.cos(angle) - tw/2;
+      const y = cy + r*Math.sin(angle) - th/2;
+      if (!overlaps(x, y, tw, th, placed)) {
+        placed.push({x, y, w:tw, h:th});
+        const el = document.createElement('span');
+        el.className = 'w ' + cls;
+        el.textContent = text;
+        el.style.cssText = `left:${x}px;top:${y}px;font-size:${size}px;font-weight:${wt}`;
+        el.addEventListener('mousemove', e => {
+          tip.textContent = text + '  ' + count + '개 문서';
+          tip.style.cssText = `left:${e.clientX+12}px;top:${e.clientY-28}px;opacity:1`;
+        });
+        el.addEventListener('mouseleave', () => tip.style.opacity = 0);
+        frag.appendChild(el);
+        break;
+      }
+    }
+  });
+  cloud.appendChild(frag);
+}
+
+let cur = DATES.length - 1;
+slider.addEventListener('input', () => { cur = +slider.value; render(cur); });
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'ArrowRight') { cur = Math.min(cur+1, DATES.length-1); slider.value=cur; render(cur); }
+  if (e.key === 'ArrowLeft')  { cur = Math.max(cur-1, 0);              slider.value=cur; render(cur); }
+});
+
+function stopPlay() {
+  playing = false; clearInterval(playTimer); playBtn.textContent = '▶ 재생';
+}
+playBtn.addEventListener('click', () => {
+  if (playing) { stopPlay(); return; }
+  playing = true; playBtn.textContent = '⏸ 일시정지';
+  playTimer = setInterval(() => {
+    cur = cur + 1 >= DATES.length ? 0 : cur + 1;
+    slider.value = cur; render(cur);
+  }, 220);
+});
+
+let rt; window.addEventListener('resize', () => { clearTimeout(rt); rt = setTimeout(() => render(cur), 120); });
+
+document.fonts.ready.then(() => render(cur));
+setTimeout(() => render(cur), 600);
+</script>
+</body></html>
