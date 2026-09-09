@@ -12,7 +12,7 @@ threshold > 0 이면 문서 임베딩과 cosine similarity가 threshold 미만�
 의존: sentence-transformers
 
 사용 예:
-    from 05_rerank import Reranker
+    from word_extractor.stage05_rerank import Reranker
     rr = Reranker()
     ranked = rr.rerank(doc_text, tfidf_ranked, pool_size=15, alpha=0.3)
     ranked = rr.rerank(doc_text, tfidf_ranked, threshold=0.1)  # 필터링만

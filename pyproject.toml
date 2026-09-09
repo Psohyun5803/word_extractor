@@ -6,10 +6,11 @@ build-backend = "setuptools.build_meta"
 name = "word-extractor"
 version = "0.1.0"
 description = "유튜브 영상 title + description에서 일별·영상별 핵심 키워드를 추출하는 파이프라인"
+readme = "docs/README.md"
+authors = [{ name = "fish895623", email = "shbae@aixcon.co.kr" }]
 requires-python = ">=3.12"
 dependencies = [
     "click>=8.1",
-    "fastapi>=0.141.1",
     "huggingface_hub>=1.25",
     "jinja2>=3.1",
     "kiwipiepy==0.23.2",
@@ -18,12 +19,16 @@ dependencies = [
     "sentence-transformers>=5.0",
     "torch>=2.0",
     "transformers>=4.40",
-    "uvicorn[standard]>=0.52.4",
-    "wordcloud>=1.9",
 ]
 
 [project.scripts]
-word-extractor = "pipeline:main"
+word-extractor = "word_extractor.pipeline:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+word_extractor = ["templates/*.jinja"]
 
 [dependency-groups]
 dev = [

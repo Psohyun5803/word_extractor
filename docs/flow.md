@@ -25,7 +25,7 @@ flowchart LR
     S5 --> S6["6 저장"]
 ```
 
-## 3. Stage 1 · CSV 로딩 & 전처리 (01_preprocess.py)
+## 3. Stage 1 · CSV 로딩 & 전처리 (stage01_preprocess.py)
 
 ```mermaid
 flowchart LR
@@ -37,7 +37,7 @@ flowchart LR
     E -->|아니오| G[전체 문서 사용]
 ```
 
-## 4. Stage 2a · 형태소 태깅 (02_tokenize.py)
+## 4. Stage 2a · 형태소 태깅 (stage02_tokenize.py)
 
 ```mermaid
 flowchart LR
@@ -59,7 +59,7 @@ flowchart LR
     D --> E[word_modifier.json 저장]
 ```
 
-## 5. Stage 3 · IDF 계산/로드/증분 (03_idf.py)
+## 5. Stage 3 · IDF 계산/로드/증분 (stage03_idf.py)
 
 ```mermaid
 flowchart TD
@@ -73,7 +73,7 @@ flowchart TD
     F --> G
 ```
 
-## 6. Stage 5 · 문서별 키워드 필터 체인 (pipeline.py + 04_extract.py)
+## 6. Stage 5 · 문서별 키워드 필터 체인 (pipeline.py + stage04_extract.py)
 
 ```mermaid
 flowchart LR
@@ -87,7 +87,7 @@ flowchart LR
 
 burst 공식: `score / (df/n_docs + burst_smooth/n_docs)` — df가 낮을수록(희귀할수록) 상위.
 
-## 6b. Stage 5 상세 · Reranker.rerank (05_rerank.py)
+## 6b. Stage 5 상세 · Reranker.rerank (stage05_rerank.py)
 
 ```mermaid
 flowchart LR
@@ -110,7 +110,7 @@ flowchart LR
     C --> F[video_keywords.json]
 ```
 
-## 8. 워드클라우드 생성 (06_visualize.py)
+## 8. 워드클라우드 생성 (stage06_visualize.py)
 
 ```mermaid
 flowchart LR

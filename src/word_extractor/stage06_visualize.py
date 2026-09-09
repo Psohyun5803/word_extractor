@@ -2,10 +2,10 @@
 stage 6 · 날짜별 워드 클라우드 (HTML 출력)
 
 CLI:
-  python 06_visualize.py --date 2026-08-09
-  python 06_visualize.py --date 2026-08-09 --out my_cloud.html
-  python 06_visualize.py --all
-  python 06_visualize.py --all --out wordcloud_all.html
+  python stage06_visualize.py --date 2026-08-09
+  python stage06_visualize.py --date 2026-08-09 --out my_cloud.html
+  python stage06_visualize.py --all
+  python stage06_visualize.py --all --out wordcloud_all.html
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader
 
-_DIR          = Path(__file__).parent.parent   # word_extractor/
+_DIR          = Path(__file__).parent.parent.parent   # word_extractor/ 루트
 DATA_PATH     = _DIR / "data" / "outputs" / "daily_keywords.json"
 FIGURES_DIR   = _DIR / "data" / "outputs" / "figures"
 TEMPLATES_DIR = Path(__file__).parent / "templates"

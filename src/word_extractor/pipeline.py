@@ -1,7 +1,7 @@
 """
 총괄 파이프라인 실행 스크립트.
 
-1_csv → 2_tokenize+modifier → 3_idf → 4_embed → 5_extract → 6_save
+1 CSV 로딩 → 2 형태소 분석+수식어 → 3 IDF → 4 임베딩 → 5 키워드 추출 → 6 저장
 
 실행 모드:
     python pipeline.py                          # 전체 실행 (idf.json 있으면 로드)
@@ -15,12 +15,11 @@
 
 run_pipeline()은 CSV → daily/video 키워드 딕셔너리를 in-memory로 계산만 하는
 라이브러리 함수로, 파일 저장은 하지 않는다 (idf.json/word_modifier.json 캐시는 예외).
-FastAPI 등에서 JSON 결과 파일을 거치지 않고 직접 호출해 쓰기 위함 (src/api.py 참고).
+외부 서비스에서 JSON 결과 파일을 거치지 않고 직접 호출해 쓰기 위함.
 """
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import os
 import sys
@@ -30,47 +29,39 @@ from pathlib import Path
 
 import click
 import pandas as pd
+import word_extractor.stage01_preprocess as preprocess
+import word_extractor.stage02_tokenize as tokenize
+import word_extractor.stage03_idf as idf_mod
+import word_extractor.stage04_extract as extract
 
 # ── 경로 ─────────────────────────────────────────────────────────────────────
-_SRC  = Path(__file__).parent          # src/ 디렉터리
-_ROOT = _SRC.parent                    # word_extractor/ 루트
+_ROOT = Path(__file__).parent.parent.parent  # word_extractor/ 루트
 
 _HF_REPO = "MindCastSogang/word_extractor"
 
 
-def _load_stage(stem: str):
-    spec = importlib.util.spec_from_file_location(stem, _SRC / f"{stem}.py")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
 def run_pipeline(
-    csv_path: Path,
-    idf_path: Path,
-    modifier_path: Path,
-    *,
-    refit_idf: bool = False,
-    update_from: str | None = None,
-    sim_threshold: float = 0.20,
-    max_df: float = 0.05,
-    modifier_threshold: float = 0.80,
-    top_n: int = 5,
-    min_df: int = 3,
-    burst_smooth: float = 1.0,
-    emb_batch: int = 256,
-    existing_daily: dict[str, list] | None = None,
-    existing_video: dict[str, list[str]] | None = None,
+        csv_path: Path,
+        idf_path: Path,
+        modifier_path: Path,
+        *,
+        refit_idf: bool = False,
+        update_from: str | None = None,
+        sim_threshold: float = 0.20,
+        max_df: float = 0.05,
+        modifier_threshold: float = 0.80,
+        top_n: int = 5,
+        min_df: int = 3,
+        burst_smooth: float = 1.0,
+        emb_batch: int = 256,
+        existing_daily: dict[str, list] | None = None,
+        existing_video: dict[str, list[str]] | None = None,
 ) -> tuple[dict[str, list[list]], dict[str, list[str]]]:
     """CSV → (daily_keywords, video_keywords) 딕셔너리를 in-memory로 계산해 반환.
 
     idf.json / word_modifier.json 은 코퍼스 통계 캐시로 계속 읽고 쓰지만,
     결과물(daily/video 키워드)은 파일에 쓰지 않는다 — 호출자가 필요하면 직접 저장한다.
     """
-    preprocess = _load_stage("01_preprocess")
-    tokenize   = _load_stage("02_tokenize")
-    idf_mod    = _load_stage("03_idf")
-    extract    = _load_stage("04_extract")
 
     if not csv_path.exists():
         from huggingface_hub import hf_hub_download
@@ -84,7 +75,7 @@ def run_pipeline(
 
     df_all = pd.read_csv(csv_path, low_memory=False,
                          usecols=["video_id", "title", "description", "uploaded_at"])
-    df_all["title"]       = df_all["title"].fillna("").astype(str)
+    df_all["title"] = df_all["title"].fillna("").astype(str)
     df_all["description"] = df_all["description"].fillna("").astype(str)
     df_all["date"] = pd.to_datetime(df_all["uploaded_at"], errors="coerce").dt.date.astype(str)
     df_all = df_all[df_all["date"] != "NaT"].reset_index(drop=True)
@@ -100,12 +91,12 @@ def run_pipeline(
     else:
         df_proc = df_all
 
-    texts     = [preprocess.combined_text(t, d)
-                 for t, d in zip(df_proc["title"], df_proc["description"])]
-    dates     = df_proc["date"].tolist()
+    texts = [preprocess.combined_text(t, d)
+             for t, d in zip(df_proc["title"], df_proc["description"])]
+    dates = df_proc["date"].tolist()
     video_ids = df_proc["video_id"].tolist()
 
-    # ── 2  형태소 분석 (Stage 3 IDF + Stage 6 modifier + Stage 7 추출, kiwi 1회) ──
+    # ── 2  형태소 분석 (IDF + 수식어 비율 + 키워드 추출에서 재사용, kiwi 1회) ──
     need_modifier = (refit_idf or not modifier_path.exists()) and not update_from
     _kiwi_workers = min(32, max(4, os.cpu_count() // 2))
     print(f"▶ 2  형태소 분석 (배치, num_workers={_kiwi_workers})...")
@@ -116,7 +107,7 @@ def run_pipeline(
     _MOD_HEAD_PREFIXES = ("J", "X", "E", "SF", "SP")
     all_tagged_seqs: list[list[tuple[str, str]]] = []
     _modifier_count: defaultdict = defaultdict(int)
-    _head_count:     defaultdict = defaultdict(int)
+    _head_count: defaultdict = defaultdict(int)
     for _token_list in _kiwi_batch.tokenize(texts):
         _tagged = []
         for _i, _tok in enumerate(_token_list):
@@ -135,7 +126,7 @@ def run_pipeline(
                 continue
             _tagged.append((_form, _tag))
         all_tagged_seqs.append(_tagged)
-    print(f"   완료: {time.time()-t0:.1f}s  ({len(all_tagged_seqs):,}개 문서)")
+    print(f"   완료: {time.time() - t0:.1f}s  ({len(all_tagged_seqs):,}개 문서)")
 
     if need_modifier:
         _MIN_COUNT = 50
@@ -179,13 +170,13 @@ def run_pipeline(
 
     # ── 4  임베딩 ────────────────────────────────────────────────────────────────
     print("▶ 4  임베딩 모델 로드 (ko-sroberta-multitask)...")
-    rerank_mod = _load_stage("05_rerank")
-    reranker   = rerank_mod.Reranker()
+    from . import stage05_rerank as rerank_mod
+    reranker = rerank_mod.Reranker()
     _mode = "증분" if update_from else "전체"
     print(f"   {_mode} 임베딩 계산 중 ({len(texts):,}개, batch={emb_batch})...")
     t0 = time.time()
     doc_embs = reranker.encode_corpus(texts, batch_size=emb_batch)
-    print(f"   완료: {time.time()-t0:.1f}s")
+    print(f"   완료: {time.time() - t0:.1f}s")
 
     # ── 5  문서별 키워드 추출 → 일별 카운트 ─────────────────────────────────────
     MAX_DF_COUNT = max_df * n_docs
@@ -199,9 +190,9 @@ def run_pipeline(
     video_kw: dict[str, list[str]] = dict(existing_video or {})
 
     t0 = time.time()
-    for idx, (text, date, vid) in enumerate(zip(texts, dates, video_ids)):
+    for idx, (date, vid) in enumerate(zip(dates, video_ids)):
         tagged = all_tagged_seqs[idx]
-        tf     = tokenize.weighted_tf(tagged)
+        tf = tokenize.weighted_tf(tagged)
         ranked = extract.score_keywords(tf, idf, n_docs)
 
         # max_df 필터
@@ -224,7 +215,7 @@ def run_pipeline(
         video_kw[str(vid)] = top_kws
 
         if (idx + 1) % 20_000 == 0:
-            elapsed   = time.time() - t0
+            elapsed = time.time() - t0
             remaining = elapsed / (idx + 1) * (len(df_proc) - idx - 1)
             print(f"   {idx + 1:,}/{len(df_proc):,}  남은 시간 약 {remaining:.0f}초")
 
@@ -275,30 +266,31 @@ def main(refit_idf, update_from, sim_threshold, max_df, modifier_threshold, top_
 
     # ── visualize-only 단축 경로 ─────────────────────────────────────────────
     if visualize_only is not None:
-        visualize = _load_stage("06_visualize")
+        from . import stage06_visualize as visualize
         if visualize_only == "__all__":
             visualize.wordcloud_all(out=viz_out)
         else:
             visualize.wordcloud_day(visualize_only, out=viz_out)
         sys.exit(0)
 
-    CSV_PATH       = _ROOT / csv_path
-    IDF_PATH       = _ROOT / idf_out
-    MODIFIER_PATH  = _ROOT / modifier_out
-    OUT_PATH       = _ROOT / out
+    CSV_PATH = _ROOT / csv_path
+    IDF_PATH = _ROOT / idf_out
+    MODIFIER_PATH = _ROOT / modifier_out
+    OUT_PATH = _ROOT / out
     VIDEO_OUT_PATH = _ROOT / "data/outputs/video_keywords.json"
 
+    UPDATE_FROM: str | None
     if update_from == "auto":
         if OUT_PATH.exists():
             with open(OUT_PATH, encoding="utf-8") as _f:
                 _ex = json.load(_f)
-            UPDATE_FROM: str | None = max(_ex.keys()) if _ex else None
+            UPDATE_FROM = max(_ex.keys()) if _ex else None
             print(f"   --update-from auto → 마지막 날짜: {UPDATE_FROM}")
         else:
             UPDATE_FROM = None
             print("   --update-from auto → 기존 결과 없음, 전체 처리")
     else:
-        UPDATE_FROM: str | None = update_from
+        UPDATE_FROM = update_from
 
     # 증분 모드에서만 기존 결과를 읽어 run_pipeline에 시드로 전달
     existing_daily: dict[str, list] = {}

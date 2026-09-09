@@ -71,14 +71,15 @@ Stage 5에서 이미 burst 기준으로 top-N 을 선별했으므로 `daily_coun
 ```
 word_extractor/
 ├── run.sh
-└── src/
-    ├── pipeline.py       메인 파이프라인
-    ├── 01_preprocess.py  텍스트 정제, 불용어
-    ├── 02_tokenize.py    형태소 분석 (kiwipiepy)
-    ├── 03_idf.py         IDF 계산 / 저장 / 로드
-    ├── 04_extract.py     TF-IDF 스코어링
-    ├── 05_rerank.py      임베딩 유사도 재순위
-    └── 06_visualize.py   워드클라우드 HTML 생성
+└── src/word_extractor/
+    ├── pipeline.py           메인 파이프라인
+    ├── stage01_preprocess.py 텍스트 정제, 불용어
+    ├── stage02_tokenize.py   형태소 분석 (kiwipiepy)
+    ├── stage03_idf.py        IDF 계산 / 저장 / 로드
+    ├── stage04_extract.py    TF-IDF 스코어링
+    ├── stage05_rerank.py     임베딩 유사도 재순위
+    ├── stage06_visualize.py  워드클라우드 HTML 생성
+    └── templates/            워드클라우드 jinja 템플릿
 
 data/outputs/
 ├── idf.json              어휘 IDF 값
@@ -107,5 +108,5 @@ data/outputs/
 
 ## 불용어 관리
 
-`src/01_preprocess.py`의 `DEFAULT_STOPWORDS`가 정본.  
+`src/word_extractor/stage01_preprocess.py`의 `DEFAULT_STOPWORDS`가 정본.  
 수정 후 `./run.sh refit`으로 재실행하면 idf.json · word_modifier.json 모두 갱신됨.

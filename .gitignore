@@ -4,7 +4,10 @@
 data/inputs/
 
 # html figure 생성 경로
-data/figures
+data/outputs/figures
+
+# 파이프라인 생성 결과 (재생성 가능한 산출물)
+data/outputs/*.json
 
 # 실시간 수집 버퍼
 buffer.jsonl
