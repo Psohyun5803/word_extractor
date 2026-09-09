@@ -24,6 +24,7 @@ import json
 import sys
 import time
 from collections import Counter, defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 
 import click
@@ -37,6 +38,46 @@ import word_extractor.stage04_extract as extract
 _ROOT = Path(__file__).parent.parent.parent  # word_extractor/ 루트
 
 _HF_REPO = "MindCastSogang/word_extractor"
+
+DEFAULT_IDF_PATH = _ROOT / "data/outputs/idf.json"
+DEFAULT_MODIFIER_PATH = _ROOT / "data/outputs/word_modifier.json"
+
+
+@dataclass(frozen=True)
+class _Scorer:
+    """문서 하나에서 top-N 키워드를 뽑는 데 필요한 코퍼스 통계 + 임계값 묶음."""
+
+    idf: dict[str, float]
+    n_docs: int
+    df_counts: dict[str, int]
+    word_modifier: dict[str, float]
+    max_df_count: float
+    modifier_threshold: float
+    sim_threshold: float
+    burst_smooth: float
+    top_n: int
+
+    def top_keywords(self, tagged: list[tuple[str, str]], doc_emb, reranker) -> list[str]:
+        tf = tokenize.weighted_tf(tagged)
+        ranked = extract.score_keywords(tf, self.idf, self.n_docs)
+
+        # max_df 필터
+        ranked = [(w, s) for w, s in ranked if self.df_counts.get(w, 0) <= self.max_df_count]
+        # 수식어 필터 (NNG만 적용, NNP/SL 보호)
+        if self.word_modifier and self.modifier_threshold <= 1.0:
+            word_tags = {w: tag for w, tag in tagged}
+            ranked = [(w, s) for w, s in ranked
+                      if word_tags.get(w, "NNG") != "NNG"
+                      or self.word_modifier.get(w, 0.0) < self.modifier_threshold]
+        ranked = reranker.rerank(doc_emb, ranked, threshold=self.sim_threshold)
+        # 버스트 스코어로 재정렬: tfidf_score / (df_rate + smooth)
+        ranked = sorted(
+            ranked,
+            key=lambda ws: ws[1] / (self.df_counts.get(ws[0], 0) / self.n_docs
+                                    + self.burst_smooth / self.n_docs),
+            reverse=True,
+        )
+        return [w for w, _ in ranked[:self.top_n]]
 
 
 def _load_documents(
@@ -153,7 +194,6 @@ def run_pipeline(
         print(f"   수식어 비율 로드: {len(word_modifier):,}개")
     else:
         word_modifier = {}
-    use_modifier = bool(word_modifier) and modifier_threshold <= 1.0
 
     # ── 3  IDF 학습 / 로드 / 증분 갱신 ──────────────────────────────────────────
     idf, n_docs, df_counts = _resolve_idf(
@@ -171,9 +211,14 @@ def run_pipeline(
     print(f"   완료: {time.time() - t0:.1f}s")
 
     # ── 5  문서별 키워드 추출 → 일별 카운트 ─────────────────────────────────────
-    max_df_count = max_df * n_docs
     print(f"▶ 5  키워드 추출 (top_n={top_n}, sim_threshold={sim_threshold}, "
           f"max_df={max_df}, modifier={modifier_threshold})...")
+
+    scorer = _Scorer(
+        idf=idf, n_docs=n_docs, df_counts=df_counts, word_modifier=word_modifier,
+        max_df_count=max_df * n_docs, modifier_threshold=modifier_threshold,
+        sim_threshold=sim_threshold, burst_smooth=burst_smooth, top_n=top_n,
+    )
 
     daily_count: dict[str, Counter] = defaultdict(Counter)
     for date, pairs in (existing_daily or {}).items():
@@ -183,26 +228,7 @@ def run_pipeline(
 
     t0 = time.time()
     for idx, (date, vid) in enumerate(zip(dates, video_ids)):
-        tagged = all_tagged_seqs[idx]
-        tf = tokenize.weighted_tf(tagged)
-        ranked = extract.score_keywords(tf, idf, n_docs)
-
-        # max_df 필터
-        ranked = [(w, s) for w, s in ranked if df_counts.get(w, 0) <= max_df_count]
-        # 수식어 필터 (NNG만 적용, NNP/SL 보호)
-        if use_modifier:
-            word_tags = {w: tag for w, tag in tagged}
-            ranked = [(w, s) for w, s in ranked
-                      if word_tags.get(w, "NNG") != "NNG"
-                      or word_modifier.get(w, 0.0) < modifier_threshold]
-        ranked = reranker.rerank(doc_embs[idx], ranked, threshold=sim_threshold)
-        # 버스트 스코어로 재정렬: tfidf_score / (df_rate + smooth)
-        ranked = sorted(
-            ranked,
-            key=lambda ws: ws[1] / (df_counts.get(ws[0], 0) / n_docs + burst_smooth / n_docs),
-            reverse=True,
-        )
-        top_kws = [w for w, _ in ranked[:top_n]]
+        top_kws = scorer.top_keywords(all_tagged_seqs[idx], doc_embs[idx], reranker)
         daily_count[date].update(top_kws)
         video_kw[str(vid)] = top_kws
 
@@ -220,6 +246,62 @@ def run_pipeline(
         for date in sorted(daily_count)
     }
     return result, video_kw
+
+
+def extract_keywords(
+        documents: list[dict],
+        *,
+        idf_path: Path = DEFAULT_IDF_PATH,
+        modifier_path: Path = DEFAULT_MODIFIER_PATH,
+        reranker=None,
+        top_n: int = 5,
+        sim_threshold: float = 0.20,
+        max_df: float = 0.05,
+        modifier_threshold: float = 0.80,
+        burst_smooth: float = 1.0,
+        emb_batch: int = 256,
+) -> list[dict]:
+    """문서 dict 리스트 → [{"word": ..., "count": ...}, ...] (count 내림차순).
+
+    documents: [{"title": ..., "description": ...}, ...] — 그 외 키는 무시.
+    count: 그 단어가 top-N 키워드로 뽑힌 문서 수.
+
+    코퍼스 통계(idf.json)는 run_pipeline()이 만들어 둔 것을 읽어 쓴다. 요청으로
+    들어온 몇 개 문서만으로 IDF를 새로 학습하는 건 의미가 없기 때문에 idf_path는
+    반드시 존재해야 한다.
+
+    reranker를 넘기지 않으면 호출마다 임베딩 모델(~400MB)을 새로 로드한다.
+    서버에서는 stage05_rerank.Reranker()를 한 번 만들어 계속 넘겨 쓸 것.
+    """
+    texts = [preprocess.combined_text(d.get("title"), d.get("description"))
+             for d in documents]
+    if not texts:
+        return []
+
+    tagged_seqs, _ = tokenize.tag_corpus(texts, preprocess.DEFAULT_STOPWORDS)
+    idf, n_docs, df_counts = idf_mod.load(idf_path)
+
+    word_modifier: dict[str, float] = {}
+    if modifier_path.exists():
+        with open(modifier_path, encoding="utf-8") as f:
+            word_modifier = json.load(f)
+
+    if reranker is None:
+        from . import stage05_rerank as rerank_mod
+        reranker = rerank_mod.Reranker()
+    doc_embs = reranker.encode_corpus(texts, batch_size=emb_batch, show_progress_bar=False)
+
+    scorer = _Scorer(
+        idf=idf, n_docs=n_docs, df_counts=df_counts, word_modifier=word_modifier,
+        max_df_count=max_df * n_docs, modifier_threshold=modifier_threshold,
+        sim_threshold=sim_threshold, burst_smooth=burst_smooth, top_n=top_n,
+    )
+
+    counts: Counter = Counter()
+    for tagged, doc_emb in zip(tagged_seqs, doc_embs):
+        counts.update(scorer.top_keywords(tagged, doc_emb, reranker))
+
+    return [{"word": word, "count": count} for word, count in counts.most_common()]
 
 
 @click.command(context_settings={"help_option_names": ["-h", "--help"]})

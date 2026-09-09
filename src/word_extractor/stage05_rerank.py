@@ -34,14 +34,19 @@ class Reranker:
 
         self._model = SentenceTransformer(model_name)
 
-    def encode_corpus(self, texts: list[str], batch_size: int = 256) -> "np.ndarray":
+    def encode_corpus(
+        self,
+        texts: list[str],
+        batch_size: int = 256,
+        show_progress_bar: bool = True,
+    ) -> "np.ndarray":
         """전체 문서 텍스트를 배치 인코딩."""
         import numpy as np
         return self._model.encode(
             texts,
             batch_size=batch_size,
             normalize_embeddings=True,
-            show_progress_bar=True,
+            show_progress_bar=show_progress_bar,
             convert_to_numpy=True,
         ).astype(np.float32)
 
