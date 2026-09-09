@@ -12,6 +12,10 @@
     python pipeline.py --visualize-only                   # 전체 날짜 워드클라우드 생성
     python pipeline.py --visualize-only 2026-08-09        # 특정 날짜만 생성
     python pipeline.py --visualize-only 2026-08-09 --viz-out my.html  # 출력 경로 지정
+
+run_pipeline()은 CSV → daily/video 키워드 딕셔너리를 in-memory로 계산만 하는
+라이브러리 함수로, 파일 저장은 하지 않는다 (idf.json/word_modifier.json 캐시는 예외).
+FastAPI 등에서 JSON 결과 파일을 거치지 않고 직접 호출해 쓰기 위함 (src/api.py 참고).
 """
 
 from __future__ import annotations
@@ -25,12 +29,13 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 import click
-import numpy as np
 import pandas as pd
 
 # ── 경로 ─────────────────────────────────────────────────────────────────────
 _SRC  = Path(__file__).parent          # src/ 디렉터리
 _ROOT = _SRC.parent                    # word_extractor/ 루트
+
+_HF_REPO = "MindCastSogang/word_extractor"
 
 
 def _load_stage(stem: str):
@@ -38,6 +43,200 @@ def _load_stage(stem: str):
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+def run_pipeline(
+    csv_path: Path,
+    idf_path: Path,
+    modifier_path: Path,
+    *,
+    refit_idf: bool = False,
+    update_from: str | None = None,
+    sim_threshold: float = 0.20,
+    max_df: float = 0.05,
+    modifier_threshold: float = 0.80,
+    top_n: int = 5,
+    min_df: int = 3,
+    burst_smooth: float = 1.0,
+    emb_batch: int = 256,
+    existing_daily: dict[str, list] | None = None,
+    existing_video: dict[str, list[str]] | None = None,
+) -> tuple[dict[str, list[list]], dict[str, list[str]]]:
+    """CSV → (daily_keywords, video_keywords) 딕셔너리를 in-memory로 계산해 반환.
+
+    idf.json / word_modifier.json 은 코퍼스 통계 캐시로 계속 읽고 쓰지만,
+    결과물(daily/video 키워드)은 파일에 쓰지 않는다 — 호출자가 필요하면 직접 저장한다.
+    """
+    preprocess = _load_stage("01_preprocess")
+    tokenize   = _load_stage("02_tokenize")
+    idf_mod    = _load_stage("03_idf")
+    extract    = _load_stage("04_extract")
+
+    if not csv_path.exists():
+        from huggingface_hub import hf_hub_download
+        print(f"   CSV 없음 → HuggingFace {_HF_REPO} 에서 다운로드...")
+        _dl = hf_hub_download(repo_id=_HF_REPO, filename="video_video.csv", repo_type="dataset",
+                              local_dir=str(csv_path.parent))
+        print(f"   다운로드 완료: {_dl}")
+
+    # ── 1  CSV 로딩 ───────────────────────────────────────────────────────────
+    print("▶ 1  CSV 로딩...")
+
+    df_all = pd.read_csv(csv_path, low_memory=False,
+                         usecols=["video_id", "title", "description", "uploaded_at"])
+    df_all["title"]       = df_all["title"].fillna("").astype(str)
+    df_all["description"] = df_all["description"].fillna("").astype(str)
+    df_all["date"] = pd.to_datetime(df_all["uploaded_at"], errors="coerce").dt.date.astype(str)
+    df_all = df_all[df_all["date"] != "NaT"].reset_index(drop=True)
+
+    print(f"   전체 {len(df_all):,}개 문서  |  {df_all['date'].min()} ~ {df_all['date'].max()}")
+
+    STOPWORDS = preprocess.DEFAULT_STOPWORDS
+
+    # 증분 모드: 기준 날짜 이후 문서만 처리
+    if update_from:
+        df_proc = df_all[df_all["date"] > update_from].reset_index(drop=True)
+        print(f"   증분 대상: {update_from} 이후  {len(df_proc):,}개 문서")
+    else:
+        df_proc = df_all
+
+    texts     = [preprocess.combined_text(t, d)
+                 for t, d in zip(df_proc["title"], df_proc["description"])]
+    dates     = df_proc["date"].tolist()
+    video_ids = df_proc["video_id"].tolist()
+
+    # ── 2  형태소 분석 (Stage 3 IDF + Stage 6 modifier + Stage 7 추출, kiwi 1회) ──
+    need_modifier = (refit_idf or not modifier_path.exists()) and not update_from
+    _kiwi_workers = min(32, max(4, os.cpu_count() // 2))
+    print(f"▶ 2  형태소 분석 (배치, num_workers={_kiwi_workers})...")
+    t0 = time.time()
+    from kiwipiepy import Kiwi as _KiwiBatch
+    _kiwi_batch = _KiwiBatch(num_workers=_kiwi_workers)
+    _KEEP = frozenset({"NNG", "NNP", "SL"})
+    _MOD_HEAD_PREFIXES = ("J", "X", "E", "SF", "SP")
+    all_tagged_seqs: list[list[tuple[str, str]]] = []
+    _modifier_count: defaultdict = defaultdict(int)
+    _head_count:     defaultdict = defaultdict(int)
+    for _token_list in _kiwi_batch.tokenize(texts):
+        _tagged = []
+        for _i, _tok in enumerate(_token_list):
+            _tag = str(_tok.tag)
+            _form = _tok.form.strip()
+            if need_modifier and _tag in _KEEP and len(_form) >= 2 and _form not in STOPWORDS:
+                if _i + 1 < len(_token_list):
+                    _next_tag = str(_token_list[_i + 1].tag)
+                    if _next_tag in _KEEP:
+                        _modifier_count[_form] += 1
+                    elif any(_next_tag.startswith(p) for p in _MOD_HEAD_PREFIXES):
+                        _head_count[_form] += 1
+                else:
+                    _head_count[_form] += 1
+            if _tok.tag not in _KEEP or len(_form) < 2 or _form in STOPWORDS:
+                continue
+            _tagged.append((_form, _tag))
+        all_tagged_seqs.append(_tagged)
+    print(f"   완료: {time.time()-t0:.1f}s  ({len(all_tagged_seqs):,}개 문서)")
+
+    if need_modifier:
+        _MIN_COUNT = 50
+        _word_modifier_computed: dict[str, float] = {}
+        for _w in set(_modifier_count) | set(_head_count):
+            _mc, _hc = _modifier_count[_w], _head_count[_w]
+            if _mc + _hc >= _MIN_COUNT:
+                _word_modifier_computed[_w] = _mc / (_mc + _hc)
+        with open(modifier_path, "w", encoding="utf-8") as _f:
+            json.dump(_word_modifier_computed, _f, ensure_ascii=False)
+        print(f"   수식어 비율 저장: {len(_word_modifier_computed):,}개 → {modifier_path.name}")
+
+    word_modifier: dict[str, float] = {}
+    if modifier_path.exists():
+        with open(modifier_path, encoding="utf-8") as f:
+            word_modifier = json.load(f)
+        if not need_modifier:
+            print(f"   수식어 비율 로드: {len(word_modifier):,}개")
+    USE_MODIFIER = bool(word_modifier) and modifier_threshold <= 1.0
+
+    # ── 3  IDF 학습 / 로드 / 증분 갱신 ──────────────────────────────────────────
+    if update_from and idf_path.exists():
+        print(f"▶ 3  IDF 증분 갱신 ({update_from} 이후 {len(df_proc):,}개 반영)...")
+        t0 = time.time()
+        new_token_seqs = [[tok for tok, _ in tagged] for tagged in all_tagged_seqs]
+        idf, n_docs, df_counts = idf_mod.update(idf_path, new_token_seqs)
+        print(f"   완료: {time.time() - t0:.1f}s  |  어휘 {len(idf):,}개  |  총 문서 {n_docs:,}개")
+
+    elif not refit_idf and idf_path.exists():
+        print(f"▶ 3  IDF 로드  ({idf_path.name})")
+        idf, n_docs, df_counts = idf_mod.load(idf_path)
+        print(f"   어휘 {len(idf):,}개  |  학습 문서 {n_docs:,}개")
+
+    else:
+        print("▶ 3  IDF 전체 학습 중...")
+        t0 = time.time()
+        all_token_seqs = [[tok for tok, _ in tagged] for tagged in all_tagged_seqs]
+        idf, n_docs, df_counts = idf_mod.fit(all_token_seqs)
+        idf_mod.save(idf, n_docs, idf_path, df=df_counts)
+        print(f"   완료: {time.time() - t0:.1f}s  |  어휘 {len(idf):,}개  →  {idf_path.name}")
+
+    # ── 4  임베딩 ────────────────────────────────────────────────────────────────
+    print("▶ 4  임베딩 모델 로드 (ko-sroberta-multitask)...")
+    rerank_mod = _load_stage("05_rerank")
+    reranker   = rerank_mod.Reranker()
+    _mode = "증분" if update_from else "전체"
+    print(f"   {_mode} 임베딩 계산 중 ({len(texts):,}개, batch={emb_batch})...")
+    t0 = time.time()
+    doc_embs = reranker.encode_corpus(texts, batch_size=emb_batch)
+    print(f"   완료: {time.time()-t0:.1f}s")
+
+    # ── 5  문서별 키워드 추출 → 일별 카운트 ─────────────────────────────────────
+    MAX_DF_COUNT = max_df * n_docs
+    print(f"▶ 5  키워드 추출 (top_n={top_n}, sim_threshold={sim_threshold}, "
+          f"max_df={max_df}, modifier={modifier_threshold})...")
+
+    daily_count: dict[str, Counter] = defaultdict(Counter)
+    for date, pairs in (existing_daily or {}).items():
+        daily_count[date].update({w: c for w, c in pairs})
+
+    video_kw: dict[str, list[str]] = dict(existing_video or {})
+
+    t0 = time.time()
+    for idx, (text, date, vid) in enumerate(zip(texts, dates, video_ids)):
+        tagged = all_tagged_seqs[idx]
+        tf     = tokenize.weighted_tf(tagged)
+        ranked = extract.score_keywords(tf, idf, n_docs)
+
+        # max_df 필터
+        ranked = [(w, s) for w, s in ranked if df_counts.get(w, 0) <= MAX_DF_COUNT]
+        # 수식어 필터 (NNG만 적용, NNP/SL 보호)
+        if USE_MODIFIER:
+            word_tags = {w: tag for w, tag in tagged}
+            ranked = [(w, s) for w, s in ranked
+                      if word_tags.get(w, "NNG") != "NNG"
+                      or word_modifier.get(w, 0.0) < modifier_threshold]
+        ranked = reranker.rerank(doc_embs[idx], ranked, threshold=sim_threshold)
+        # 버스트 스코어로 재정렬: tfidf_score / (df_rate + smooth)
+        ranked = sorted(
+            ranked,
+            key=lambda ws: ws[1] / (df_counts.get(ws[0], 0) / n_docs + burst_smooth / n_docs),
+            reverse=True,
+        )
+        top_kws = [w for w, _ in ranked[:top_n]]
+        daily_count[date].update(top_kws)
+        video_kw[str(vid)] = top_kws
+
+        if (idx + 1) % 20_000 == 0:
+            elapsed   = time.time() - t0
+            remaining = elapsed / (idx + 1) * (len(df_proc) - idx - 1)
+            print(f"   {idx + 1:,}/{len(df_proc):,}  남은 시간 약 {remaining:.0f}초")
+
+    print(f"   완료: {time.time() - t0:.1f}s")
+
+    # Stage 5에서 이미 burst 기준으로 top-N을 뽑았으므로
+    # daily_count는 burst 필터를 통과한 단어만 집계됨 → count 순 정렬로 충분
+    result = {
+        date: [[w, c] for w, c in daily_count[date].most_common(30) if c >= min_df]
+        for date in sorted(daily_count)
+    }
+    return result, video_kw
 
 
 @click.command(context_settings={"help_option_names": ["-h", "--help"]})
@@ -83,25 +282,12 @@ def main(refit_idf, update_from, sim_threshold, max_df, modifier_threshold, top_
             visualize.wordcloud_day(visualize_only, out=viz_out)
         sys.exit(0)
 
-    preprocess = _load_stage("01_preprocess")
-    tokenize   = _load_stage("02_tokenize")
-    idf_mod    = _load_stage("03_idf")
-    extract    = _load_stage("04_extract")
+    CSV_PATH       = _ROOT / csv_path
+    IDF_PATH       = _ROOT / idf_out
+    MODIFIER_PATH  = _ROOT / modifier_out
+    OUT_PATH       = _ROOT / out
+    VIDEO_OUT_PATH = _ROOT / "data/outputs/video_keywords.json"
 
-    CSV_PATH      = _ROOT / csv_path
-    _HF_REPO      = "MindCastSogang/word_extractor"
-    if not CSV_PATH.exists():
-        from huggingface_hub import hf_hub_download
-        print(f"   CSV 없음 → HuggingFace {_HF_REPO} 에서 다운로드...")
-        _dl = hf_hub_download(repo_id=_HF_REPO, filename="video_video.csv", repo_type="dataset",
-                              local_dir=str(CSV_PATH.parent))
-        print(f"   다운로드 완료: {_dl}")
-    IDF_PATH      = _ROOT / idf_out
-    MODIFIER_PATH = _ROOT / modifier_out
-    OUT_PATH      = _ROOT / out
-    VIDEO_OUT_PATH   = _ROOT / "data/outputs/video_keywords.json"
-    TOP_N        = top_n
-    MIN_DF       = min_df
     if update_from == "auto":
         if OUT_PATH.exists():
             with open(OUT_PATH, encoding="utf-8") as _f:
@@ -114,184 +300,32 @@ def main(refit_idf, update_from, sim_threshold, max_df, modifier_threshold, top_
     else:
         UPDATE_FROM: str | None = update_from
 
-    # ── 1  CSV 로딩 ───────────────────────────────────────────────────────────
-    print("▶ 1  CSV 로딩...")
-    t_start = time.time()
-
-    df_all = pd.read_csv(CSV_PATH, low_memory=False,
-                         usecols=["video_id", "title", "description", "uploaded_at"])
-    df_all["title"]       = df_all["title"].fillna("").astype(str)
-    df_all["description"] = df_all["description"].fillna("").astype(str)
-    df_all["date"] = pd.to_datetime(df_all["uploaded_at"], errors="coerce").dt.date.astype(str)
-    df_all = df_all[df_all["date"] != "NaT"].reset_index(drop=True)
-
-    print(f"   전체 {len(df_all):,}개 문서  |  {df_all['date'].min()} ~ {df_all['date'].max()}")
-
-    STOPWORDS = preprocess.DEFAULT_STOPWORDS
-
-    # 증분 모드: 기준 날짜 이후 문서만 처리
-    if UPDATE_FROM:
-        df_new = df_all[df_all["date"] > UPDATE_FROM].reset_index(drop=True)
-        df_proc = df_new
-        print(f"   증분 대상: {UPDATE_FROM} 이후  {len(df_proc):,}개 문서")
-    else:
-        df_proc = df_all
-
-    texts     = [preprocess.combined_text(t, d)
-                 for t, d in zip(df_proc["title"], df_proc["description"])]
-    dates     = df_proc["date"].tolist()
-    video_ids = df_proc["video_id"].tolist()
-
-    # ── 2  형태소 분석 (Stage 3 IDF + Stage 6 modifier + Stage 7 추출, kiwi 1회) ──
-    need_modifier = (refit_idf or not MODIFIER_PATH.exists()) and not UPDATE_FROM
-    _kiwi_workers = min(32, max(4, os.cpu_count() // 2))
-    print(f"▶ 2  형태소 분석 (배치, num_workers={_kiwi_workers})...")
-    t0 = time.time()
-    from kiwipiepy import Kiwi as _KiwiBatch
-    _kiwi_batch = _KiwiBatch(num_workers=_kiwi_workers)
-    _KEEP = frozenset({"NNG", "NNP", "SL"})
-    _MOD_HEAD_PREFIXES = ("J", "X", "E", "SF", "SP")
-    all_tagged_seqs: list[list[tuple[str, str]]] = []
-    _modifier_count: defaultdict = defaultdict(int)
-    _head_count:     defaultdict = defaultdict(int)
-    for _token_list in _kiwi_batch.tokenize(texts):
-        _tagged = []
-        for _i, _tok in enumerate(_token_list):
-            _tag = str(_tok.tag)
-            _form = _tok.form.strip()
-            if need_modifier and _tag in _KEEP and len(_form) >= 2 and _form not in STOPWORDS:
-                if _i + 1 < len(_token_list):
-                    _next_tag = str(_token_list[_i + 1].tag)
-                    if _next_tag in _KEEP:
-                        _modifier_count[_form] += 1
-                    elif any(_next_tag.startswith(p) for p in _MOD_HEAD_PREFIXES):
-                        _head_count[_form] += 1
-                else:
-                    _head_count[_form] += 1
-            if _tok.tag not in _KEEP or len(_form) < 2 or _form in STOPWORDS:
-                continue
-            _tagged.append((_form, _tag))
-        all_tagged_seqs.append(_tagged)
-    print(f"   완료: {time.time()-t0:.1f}s  ({len(all_tagged_seqs):,}개 문서)")
-
-    if need_modifier:
-        _MIN_COUNT = 50
-        _word_modifier_computed: dict[str, float] = {}
-        for _w in set(_modifier_count) | set(_head_count):
-            _mc, _hc = _modifier_count[_w], _head_count[_w]
-            if _mc + _hc >= _MIN_COUNT:
-                _word_modifier_computed[_w] = _mc / (_mc + _hc)
-        with open(MODIFIER_PATH, "w", encoding="utf-8") as _f:
-            json.dump(_word_modifier_computed, _f, ensure_ascii=False)
-        print(f"   수식어 비율 저장: {len(_word_modifier_computed):,}개 → {MODIFIER_PATH.name}")
-
-    word_modifier: dict[str, float] = {}
-    if MODIFIER_PATH.exists():
-        with open(MODIFIER_PATH, encoding="utf-8") as f:
-            word_modifier = json.load(f)
-        if not need_modifier:
-            print(f"   수식어 비율 로드: {len(word_modifier):,}개")
-    USE_MODIFIER = bool(word_modifier) and modifier_threshold <= 1.0
-
-    # ── 3  IDF 학습 / 로드 / 증분 갱신 ──────────────────────────────────────────
-    all_token_seqs = None
-
-    if UPDATE_FROM and IDF_PATH.exists():
-        print(f"▶ 3  IDF 증분 갱신 ({UPDATE_FROM} 이후 {len(df_proc):,}개 반영)...")
-        t0 = time.time()
-        new_token_seqs = [[tok for tok, _ in tagged] for tagged in all_tagged_seqs]
-        idf, n_docs, df_counts = idf_mod.update(IDF_PATH, new_token_seqs)
-        print(f"   완료: {time.time() - t0:.1f}s  |  어휘 {len(idf):,}개  |  총 문서 {n_docs:,}개")
-
-    elif not refit_idf and IDF_PATH.exists():
-        print(f"▶ 3  IDF 로드  ({IDF_PATH.name})")
-        idf, n_docs, df_counts = idf_mod.load(IDF_PATH)
-        print(f"   어휘 {len(idf):,}개  |  학습 문서 {n_docs:,}개")
-
-    else:
-        print("▶ 3  IDF 전체 학습 중...")
-        t0 = time.time()
-        all_token_seqs = [[tok for tok, _ in tagged] for tagged in all_tagged_seqs]
-        idf, n_docs, df_counts = idf_mod.fit(all_token_seqs)
-        idf_mod.save(idf, n_docs, IDF_PATH, df=df_counts)
-        print(f"   완료: {time.time() - t0:.1f}s  |  어휘 {len(idf):,}개  →  {IDF_PATH.name}")
-
-    # ── 4  임베딩 ────────────────────────────────────────────────────────────────
-    print(f"▶ 4  임베딩 모델 로드 (ko-sroberta-multitask)...")
-    rerank_mod = _load_stage("05_rerank")
-    reranker   = rerank_mod.Reranker()
-    _mode = "증분" if UPDATE_FROM else "전체"
-    print(f"   {_mode} 임베딩 계산 중 ({len(texts):,}개, batch={emb_batch})...")
-    t0 = time.time()
-    doc_embs = reranker.encode_corpus(texts, batch_size=emb_batch)
-    print(f"   완료: {time.time()-t0:.1f}s")
-
-    # ── 5  문서별 키워드 추출 → 일별 카운트 ─────────────────────────────────────
-    MAX_DF_COUNT = max_df * n_docs
-    print(f"▶ 5  키워드 추출 (top_n={TOP_N}, sim_threshold={sim_threshold}, "
-          f"max_df={max_df}, modifier={modifier_threshold})...")
-
-    # 증분 모드: UPDATE_FROM 이전 날짜만 로드 (이후 날짜는 새로 계산)
-    daily_count: dict[str, Counter] = defaultdict(Counter)
+    # 증분 모드에서만 기존 결과를 읽어 run_pipeline에 시드로 전달
+    existing_daily: dict[str, list] = {}
     if UPDATE_FROM and OUT_PATH.exists():
         with open(OUT_PATH, encoding="utf-8") as f:
             existing = json.load(f)
-        kept = {d: p for d, p in existing.items() if d <= UPDATE_FROM}
-        for date, pairs in kept.items():
-            daily_count[date].update({w: c for w, c in pairs})
-        print(f"   기존 결과 로드: {len(kept)}일 (UPDATE_FROM 이전)")
+        existing_daily = {d: p for d, p in existing.items() if d <= UPDATE_FROM}
+        print(f"   기존 결과 로드: {len(existing_daily)}일 (UPDATE_FROM 이전)")
 
-    video_kw: dict[str, list[str]] = {}
+    existing_video: dict[str, list[str]] = {}
     if UPDATE_FROM and VIDEO_OUT_PATH.exists():
         with open(VIDEO_OUT_PATH, encoding="utf-8") as f:
-            video_kw = json.load(f)
+            existing_video = json.load(f)
 
-    t0 = time.time()
-    for idx, (text, date, vid) in enumerate(zip(texts, dates, video_ids)):
-        tagged = all_tagged_seqs[idx]
-        tf     = tokenize.weighted_tf(tagged)
-        ranked = extract.score_keywords(tf, idf, n_docs)
-
-        # max_df 필터
-        ranked = [(w, s) for w, s in ranked if df_counts.get(w, 0) <= MAX_DF_COUNT]
-        # 수식어 필터 (NNG만 적용, NNP/SL 보호)
-        if USE_MODIFIER:
-            word_tags = {w: tag for w, tag in tagged}
-            ranked = [(w, s) for w, s in ranked
-                      if word_tags.get(w, "NNG") != "NNG"
-                      or word_modifier.get(w, 0.0) < modifier_threshold]
-        ranked = reranker.rerank(doc_embs[idx], ranked, threshold=sim_threshold)
-        # 버스트 스코어로 재정렬: tfidf_score / (df_rate + smooth)
-        # df_rate = df / n_docs → 흔할수록 낮은 버스트
-        ranked = sorted(
-            ranked,
-            key=lambda ws: ws[1] / (df_counts.get(ws[0], 0) / n_docs + burst_smooth / n_docs),
-            reverse=True,
-        )
-        top_kws = [w for w, _ in ranked[:TOP_N]]
-        daily_count[date].update(top_kws)
-        video_kw[str(vid)] = top_kws
-
-        if (idx + 1) % 20_000 == 0:
-            elapsed   = time.time() - t0
-            remaining = elapsed / (idx + 1) * (len(df_proc) - idx - 1)
-            print(f"   {idx + 1:,}/{len(df_proc):,}  남은 시간 약 {remaining:.0f}초")
-
-    print(f"   완료: {time.time() - t0:.1f}s")
+    t_start = time.time()
+    result, video_kw = run_pipeline(
+        CSV_PATH, IDF_PATH, MODIFIER_PATH,
+        refit_idf=refit_idf, update_from=UPDATE_FROM,
+        sim_threshold=sim_threshold, max_df=max_df, modifier_threshold=modifier_threshold,
+        top_n=top_n, min_df=min_df, burst_smooth=burst_smooth, emb_batch=emb_batch,
+        existing_daily=existing_daily, existing_video=existing_video,
+    )
 
     # ── 6  저장 ───────────────────────────────────────────────────────────────────
     print("▶ 6  저장 중...")
-
-    # Stage 5에서 이미 burst 기준으로 top-N을 뽑았으므로
-    # daily_count는 burst 필터를 통과한 단어만 집계됨 → count 순 정렬로 충분
-    result = {
-        date: [[w, c] for w, c in daily_count[date].most_common(30) if c >= MIN_DF]
-        for date in sorted(daily_count)
-    }
-
     with open(OUT_PATH, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False)
-
     with open(VIDEO_OUT_PATH, "w", encoding="utf-8") as f:
         json.dump(video_kw, f, ensure_ascii=False)
 
@@ -300,7 +334,7 @@ def main(refit_idf, update_from, sim_threshold, max_df, modifier_threshold, top_
     print(f"  일 범위: {min(result)} ~ {max(result)}  ({len(result)}일)")
     print(f"  총 소요: {total:.1f}s  ({total / 60:.1f}분)")
 
-    print(f"\n샘플 (최근일 상위 10):")
+    print("\n샘플 (최근일 상위 10):")
     last_date = max(result.keys())
     for i, (w, c) in enumerate(result[last_date][:10], 1):
         print(f"  {i:2d}. {w:<14}  {c}개 문서")
