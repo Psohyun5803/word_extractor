@@ -48,8 +48,11 @@ def _load_documents(
                      usecols=["video_id", "title", "description", "uploaded_at"])
     df["title"] = df["title"].fillna("").astype(str)
     df["description"] = df["description"].fillna("").astype(str)
-    df["date"] = pd.to_datetime(df["uploaded_at"], errors="coerce").dt.date.astype(str)
-    df = df[df["date"] != "NaT"].reset_index(drop=True)
+    # 파싱 실패한 행은 문자열로 굳히기 전에 걸러낸다. pandas 3부터 astype(str)이
+    # 결측을 "NaT"가 아니라 float nan 으로 남겨서, 문자열 비교로는 못 거른다.
+    parsed = pd.to_datetime(df["uploaded_at"], errors="coerce")
+    df = df[parsed.notna()].reset_index(drop=True)
+    df["date"] = parsed[parsed.notna()].reset_index(drop=True).dt.date.astype(str)
     print(f"   전체 {len(df):,}개 문서  |  {df['date'].min()} ~ {df['date'].max()}")
 
     if update_from:
