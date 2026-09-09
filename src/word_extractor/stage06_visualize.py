@@ -28,40 +28,43 @@ _env.policies["json.dumps_kwargs"] = {"ensure_ascii": False, "sort_keys": False}
 DAYS_KO = ["월", "화", "수", "목", "금", "토", "일"]
 
 
-def wordcloud_all(out: str | None = None) -> Path:
+def _load_daily() -> dict[str, list]:
     with open(DATA_PATH, encoding="utf-8") as f:
-        data = json.load(f)
+        return json.load(f)
 
+
+def _render(template: str, out: str | None, default_name: str, **context) -> Path:
+    """템플릿을 렌더해 out(없으면 figures/default_name)에 쓰고 경로를 반환."""
+    html = _env.get_template(template).render(**context)
+    FIGURES_DIR.mkdir(exist_ok=True)
+    path = Path(out) if out else FIGURES_DIR / default_name
+    path.write_text(html, encoding="utf-8")
+    return path
+
+
+def wordcloud_all(out: str | None = None) -> Path:
+    data = _load_daily()
     dates = sorted(data.keys())
-    html = _env.get_template("wordcloud_all.html.jinja").render(
+    path = _render(
+        "wordcloud_all.html.jinja", out, "wordcloud_all.html",
         dates=dates, data=data, cloud_height_offset=86,
     )
-
-    FIGURES_DIR.mkdir(exist_ok=True)
-    path = Path(out) if out else FIGURES_DIR / "wordcloud_all.html"
-    path.write_text(html, encoding="utf-8")
     print(f"저장: {path}  ({len(dates)}일)")
     return path
 
 
 def wordcloud_day(date: str, out: str | None = None) -> Path:
-    with open(DATA_PATH, encoding="utf-8") as f:
-        data = json.load(f)
-
-    pairs = data.get(date, [])
+    pairs = _load_daily().get(date, [])
     if not pairs:
         raise ValueError(f"데이터 없음: {date}")
 
     y, m, d = date.split("-")
     dow = DAYS_KO[datetime(int(y), int(m), int(d)).weekday()]
-    html = _env.get_template("wordcloud_day.html.jinja").render(
+    path = _render(
+        "wordcloud_day.html.jinja", out, f"wordcloud_{date}.html",
         date=date, year=y, month=int(m), day=int(d), dow=dow,
         pairs=pairs, cloud_height_offset=90,
     )
-
-    FIGURES_DIR.mkdir(exist_ok=True)
-    path = Path(out) if out else FIGURES_DIR / f"wordcloud_{date}.html"
-    path.write_text(html, encoding="utf-8")
     print(f"저장: {path}")
     return path
 

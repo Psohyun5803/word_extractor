@@ -52,7 +52,6 @@ class Reranker:
         pool_size: int = 15,
         alpha: float = 0.3,
         threshold: float = 0.0,
-        word_embs: "dict[str, np.ndarray] | None" = None,
     ) -> list[tuple[str, float]]:
         """
         doc_text_or_emb: 문서 텍스트(str) 또는 사전 인코딩된 임베딩 벡터(np.ndarray)
@@ -60,10 +59,7 @@ class Reranker:
         pool_size: 재순위 대상 상위 N개
         alpha:     보정 강도 [1-alpha, 1+alpha]
         threshold: cosine similarity 하한 (0.0=필터링 없음)
-        word_embs: 사전 계산된 어휘 임베딩 {word: emb} — 제공 시 model.encode 생략
         """
-        import numpy as np
-
         if not ranked:
             return ranked
 
@@ -76,16 +72,8 @@ class Reranker:
         else:
             doc_emb = doc_text_or_emb  # 사전 계산된 벡터
 
-        if word_embs is not None:
-            available = [(item, word_embs[w]) for item, w in zip(pool, words) if w in word_embs]
-            if not available:
-                return tail
-            pool, emb_list = zip(*available)
-            pool = list(pool)
-            cand_emb = np.stack(emb_list)
-        else:
-            cand_emb = self._model.encode(words, normalize_embeddings=True)
-        sims     = cand_emb @ doc_emb
+        cand_emb = self._model.encode(words, normalize_embeddings=True)
+        sims = cand_emb @ doc_emb
 
         pool_filtered = [(item, float(sim)) for item, sim in zip(pool, sims)
                          if float(sim) >= threshold]

@@ -87,28 +87,13 @@ def update(
     df_dict = dict(df)
     idf = _compute_idf(df_dict, n_docs, max_df)
 
-    _write(path, idf, n_docs, max_df, df_dict)
+    save(idf, n_docs, path, max_df, df_dict)
     return idf, n_docs, df_dict
 
 
 def unseen_idf(n_docs: int) -> float:
     """코퍼스에 없던 단어에 줄 IDF (df=1 취급)."""
     return math.log((n_docs + 1) / 2) + 1.0
-
-
-def _write(
-    path: str | Path,
-    idf: dict[str, float],
-    n_docs: int,
-    max_df: float,
-    df: dict[str, int],
-) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(
-            {"n_docs": n_docs, "max_df": max_df, "df": df, "idf": idf},
-            f,
-            ensure_ascii=False,
-        )
 
 
 def save(
@@ -118,7 +103,12 @@ def save(
     max_df: float = 0.3,
     df: dict[str, int] | None = None,
 ) -> None:
-    _write(path, idf, n_docs, max_df, df or {})
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(
+            {"n_docs": n_docs, "max_df": max_df, "df": df or {}, "idf": idf},
+            f,
+            ensure_ascii=False,
+        )
 
 
 def load(path: str | Path) -> tuple[dict[str, float], int, dict[str, int]]:
