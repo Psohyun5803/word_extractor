@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "유튜브 영상 title + description에서 일별·영상별 핵심 키워드를 추출하는 파이프라인"
 requires-python = ">=3.12"
 dependencies = [
+    "click>=8.1",
     "huggingface_hub>=1.25",
     "kiwipiepy==0.23.2",
     "numpy>=2.0",
@@ -20,3 +21,8 @@ dependencies = [
 
 [project.scripts]
 word-extractor = "pipeline:main"
+
+[dependency-groups]
+dev = [
+    "pandas-stubs>=3.0.5.260730",
+]
